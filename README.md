@@ -5,6 +5,7 @@
 -----------------------------------------------
 
 # Megalodon
+
 Reference implementation of Megalodon 7B model.
 
 >[Megalodon: Efficient LLM Pretraining and Inference with Unlimited Context Length](https://arxiv.org/abs/2404.08801)
@@ -14,20 +15,21 @@ Reference implementation of Megalodon 7B model.
 Discord: [https://discord.gg/Unf8Fa7kWt](https://discord.gg/Unf8Fa7kWt)
 
 ## Updates
+
 1. [April 15th 2024] Release Repo to public.
 
 ## Installation
 
-First, ensure you have a venv with updated python packaging software:
+First, ensure you have a venv and install ninja:
 
 ```sh
 # create and activate your virtual environment if not done so already
-pip install -U pip ninja wheel packaging
+pip install -U ninja
 ```
 
-Then, install PyTorch 2.0.1 with cuda 11.7[^1]. Alternate (non-Conda) [installation methods can be found here](https://pytorch.org/get-started/previous-versions/#v201) for PyTorch 2.0.1  
+Then, install PyTorch 2.0.1 with cuda 11.7[^1]. Alternate (non-Conda) [installation methods can be found here](https://pytorch.org/get-started/previous-versions/#v201) for PyTorch 2.0.1
 
-[^1]: TBD as to whether the specific CUDA version matters
+[^1]: CUDA extensions **require** that your torch CUDA version and system CUDA version match. If your system CUDA version is 12.\*, then you should install a (_more recent_) PyTorch version with CUDA 12.\*.
 
 ```bash
 conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.7 -c pytorch -c nvidia
@@ -44,7 +46,7 @@ pip install git+https://github.com/facebookresearch/fairscale.git@ngoyal_bf16_ch
 **method 2:** standard install from source
 
 ```bash
-# clone the repo 
+# clone the repo
 git clone https://github.com/facebookresearch/fairscale.git
 cd fairscale
 
@@ -55,17 +57,22 @@ git checkout ngoyal_bf16_changes
 pip install .
 ```
 
-Finally, install megalodon:
+Finally, install megalodon by cloning the repo (+ relevant branch) and installing:
 
 ```bash
 git clone https://github.com/pszemraj/megalodon.git
 cd megalodon
 pip install -r requirements.txt
-pip install -e .
+# Note: this can take a while (installs 16 CUDA extensions)
+pip install -e . -v --no-build-isolation
 ```
 
+If you have install issues, check the verbose log for the error message and go from there. An example working install is on [Colab here](https://colab.research.google.com/gist/pszemraj/f991bda6323ec3fc16b6033f9974d450/megalodon-official-attempt-to-install-no-packaging-upgrades.ipynb) for reference.
+
 ## Evaluating Pretrained LLMs
+
 To launch an evaluation job, we recommend to use `torchrun` or `slurm`. We provide an example script of `torchrun`
+
 ```bash
 export NGPU=<NUM_GPUS>; torchrun --nproc_per_node=$NGPU eval.py \
         --model_parallel_size 1 \
@@ -78,10 +85,13 @@ export NGPU=<NUM_GPUS>; torchrun --nproc_per_node=$NGPU eval.py \
         --prompt_path <Prompt File Path> \
         --batch_size <Batch Size>
 ```
+
 All the data should be prepared in `jsonl` format where the content texts are in the `text` field of each json item.
 
 ## Launching a job for LLM pretraining
+
 We provide a pseudo code for LLM pretraining
+
 ```python
 from logging import getLogger
 from megalodon.logger import initialize_logger
@@ -143,7 +153,7 @@ for batch in dataloader:
     pred, _ = model(x)  # forward pass
     tok_loss = cross_entropy(pred, y)
     loss = tok_loss.mean()
-    
+
     loss.backward()  # backward pass
     model.grad_all_reduce()  # sync grad across each chunk parallel group
     clip_grad_norm_(fsdp_module=model, max_norm=cfg.optim.clip)  # grad clip
@@ -155,9 +165,10 @@ for batch in dataloader:
 ```
 
 ## References
+
 ```
 @misc{ma2024megalodon,
-      title={Megalodon: Efficient LLM Pretraining and Inference with Unlimited Context Length}, 
+      title={Megalodon: Efficient LLM Pretraining and Inference with Unlimited Context Length},
       author={Xuezhe Ma and Xiaomeng Yang and Wenhan Xiong and Beidi Chen and Lili Yu and Hao Zhang and Jonathan May and Luke Zettlemoyer and Omer Levy and Chunting Zhou},
       year={2024},
       eprint={2404.08801},
