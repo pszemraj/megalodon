@@ -1,32 +1,26 @@
 import os
-import math
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, List, Union
+from typing import Optional, Tuple, Dict, Any
 
 import torch
-import torch.nn.functional as F
 
 from megalodon.config import ModelConf, TokenizerConf, logger
 from megalodon.data.tokenizer import Tokenizer
 from megalodon.model.mega import (
-    build_model,
     Mega,
 )
 from megalodon.distributed import (
     init_signal_handler,
     init_torch_distributed,
-    get_data_parallel_world_size,
     get_model_parallel_world_size,
     get_chunk_parallel_world_size,
-    get_data_parallel_rank,
     get_model_parallel_rank,
     initialize_model_parallel,
 )
 from megalodon.utils import (
     get_default_half,
-    get_parallel_ranks,
     get_torch_dtype
 )
 
@@ -130,7 +124,7 @@ def load_consolidated_weights(ckpt_dir: Path, model: Mega, reloaded: ReloadedCon
     state_dict = torch.load(consolidated_ckpt_path, map_location="cpu")
     logger.info("Done loading consolidated ckpt")
     load_state_dict(model, state_dict, strict=False)
-    logger.info(f"Done with state-dict reloading.")
+    logger.info("Done with state-dict reloading.")
 
 
 def load_state_dict(model: Mega, state_dict: Dict, strict: bool):
@@ -143,13 +137,13 @@ def load_state_dict(model: Mega, state_dict: Dict, strict: bool):
 
 def build_consolidated_model(model_cfg: ModelConf, dtype: str) -> Mega:
     logger.info(
-        f"Start: building consolidated model..."
+        "Start: building consolidated model..."
     )
     model = Mega(model_cfg)
     model.to(get_torch_dtype(dtype))
     model = model.cuda()
     logger.info(
-        f"Done: building consolidated model."
+        "Done: building consolidated model."
     )
     return model
 
