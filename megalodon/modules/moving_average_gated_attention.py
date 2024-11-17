@@ -6,7 +6,7 @@ from torch import Tensor, nn
 from torch.nn import Parameter
 
 from .rotary_positional_embedding import apply_rotary_emb
-from .layer_norm import FusedRMSNorm
+from .layer_norm import RMSNorm
 from .timestep_norm import TimestepNorm
 from .complex_exponential_moving_average import MultiHeadComplexEMA
 from megalodon.distributed import (
@@ -34,10 +34,9 @@ _r2c = torch.view_as_complex
 
 
 def get_efficient_attention_function(attn_name: str):
-    return {
-        "swift": swift_efficient_attention,
-        "fused": swift_efficient_attention
-    }[attn_name]
+    return {"swift": swift_efficient_attention, "fused": swift_efficient_attention}[
+        attn_name
+    ]
 
 
 class _InnerAttention(nn.Module):
@@ -96,8 +95,8 @@ class _InnerAttention(nn.Module):
 
             clen = count + slen
             new_count = clen % self.chunk_size
-            cache_k = xk.detach()[:, (clen - new_count):]
-            cache_v = xv.detach()[:, (clen - new_count):]
+            cache_k = xk.detach()[:, (clen - new_count) :]
+            cache_v = xv.detach()[:, (clen - new_count) :]
             new_cache = (cache_k, cache_v, new_count)
 
         if self.chunk_size < slen:
@@ -133,13 +132,17 @@ class _InnerAttention(nn.Module):
                 use_causal_mask = False
             else:
                 use_causal_mask = True
-            output = self.attn_fn(xq, xk, xv, 1.0, self.dropout, use_causal_mask, self.training)
+            output = self.attn_fn(
+                xq, xk, xv, 1.0, self.dropout, use_causal_mask, self.training
+            )
 
         output = output.view(bs, slen, -1)
         return output, new_cache
 
     def extra_repr(self) -> str:
-        return 'heads={}, z_head_dim={}, v_head_dim={}, chunk={}'.format(self.n_heads, self.z_head_dim, self.v_head_dim, self.chunk_size)
+        return "heads={}, z_head_dim={}, v_head_dim={}, chunk={}".format(
+            self.n_heads, self.z_head_dim, self.v_head_dim, self.chunk_size
+        )
 
 
 class MovingAverageGatedAttention(nn.Module):
@@ -162,7 +165,7 @@ class MovingAverageGatedAttention(nn.Module):
         norm_num_groups: Optional[int] = None,
         norm_affine: bool = True,
         norm_eps: float = 1e-5,
-        init_mode: str = 'he',
+        init_mode: str = "he",
     ):
         super().__init__()
 
@@ -178,7 +181,9 @@ class MovingAverageGatedAttention(nn.Module):
 
         # Divide the weight matrix along the last dimension.
         model_parallel_world_size = get_model_parallel_world_size()
-        self.local_heads = divide_and_check_no_remainder(num_heads, model_parallel_world_size)
+        self.local_heads = divide_and_check_no_remainder(
+            num_heads, model_parallel_world_size
+        )
         self.local_mdim = divide_and_check_no_remainder(mdim, model_parallel_world_size)
 
         self.chunk_size = chunk_size
@@ -189,8 +194,8 @@ class MovingAverageGatedAttention(nn.Module):
 
         self.timenorm = TimestepNorm(mdim, norm_num_groups, eps=norm_eps)
         self.cema = MultiHeadComplexEMA(mdim, ndim)
-        self.rmsnorm = FusedRMSNorm(mdim, elementwise_affine=norm_affine, eps=norm_eps)
-        self.znorm = FusedRMSNorm(self.z_head_dim, elementwise_affine=False, eps=norm_eps)
+        self.rmsnorm = RMSNorm(mdim, elementwise_affine=norm_affine, eps=norm_eps)
+        self.znorm = RMSNorm(self.z_head_dim, elementwise_affine=False, eps=norm_eps)
 
         init_fn = get_init_fn(init_mode)
         self.wv = ColumnParallelLinear(
@@ -199,7 +204,7 @@ class MovingAverageGatedAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             gather_output=False,
-            init_method=init_fn
+            init_method=init_fn,
         )
         self.wz = ColumnParallelLinear(
             mdim,
@@ -207,7 +212,7 @@ class MovingAverageGatedAttention(nn.Module):
             bias=True,
             input_is_parallel=False,
             gather_output=False,
-            init_method=init_fn
+            init_method=init_fn,
         )
         self.wr = ColumnParallelLinear(
             mdim,
@@ -215,7 +220,7 @@ class MovingAverageGatedAttention(nn.Module):
             bias=True,
             input_is_parallel=False,
             gather_output=False,
-            init_method=init_fn
+            init_method=init_fn,
         )
         self.wh1 = ColumnParallelLinear(
             mdim,
@@ -223,7 +228,7 @@ class MovingAverageGatedAttention(nn.Module):
             bias=True,
             input_is_parallel=False,
             gather_output=False,
-            init_method=init_fn
+            init_method=init_fn,
         )
         self.wh2 = RowParallelLinear(
             hdim,
@@ -231,7 +236,7 @@ class MovingAverageGatedAttention(nn.Module):
             bias=False,
             input_is_parallel=True,
             parallel_output=True,
-            init_method=init_fn
+            init_method=init_fn,
         )
         self.inner_attention = _InnerAttention(
             self.z_head_dim,
@@ -239,7 +244,7 @@ class MovingAverageGatedAttention(nn.Module):
             self.local_heads,
             self.chunk_size,
             self.attention_dropout,
-            efficient_attn
+            efficient_attn,
         )
         self.gamma = Parameter(torch.zeros(2, self.z_head_dim * self.local_heads))
         self.beta = Parameter(torch.zeros(2, self.z_head_dim * self.local_heads))
@@ -250,8 +255,15 @@ class MovingAverageGatedAttention(nn.Module):
         n_groups = self.timenorm.groups_per_partition
         ndim = self.cema.ndim
         dim = self.local_mdim
-        prev_count = torch.full((bsz,), seq_len * chunk_rank, dtype=torch.int64, device=x.device)
-        prev_tensor = torch.empty((bsz, n_groups * 2 + dim * ndim * 2), dtype=torch.float32, device=x.device, requires_grad=self.training)
+        prev_count = torch.full(
+            (bsz,), seq_len * chunk_rank, dtype=torch.int64, device=x.device
+        )
+        prev_tensor = torch.empty(
+            (bsz, n_groups * 2 + dim * ndim * 2),
+            dtype=torch.float32,
+            device=x.device,
+            requires_grad=self.training,
+        )
         return prev_count, prev_tensor
 
     def _pack_prev_tensors(self, prev_mean, prev_var, hx):
@@ -266,7 +278,9 @@ class MovingAverageGatedAttention(nn.Module):
         n_groups = self.timenorm.groups_per_partition
         ndim = self.cema.ndim
         dim = self.local_mdim
-        prev_mean, prev_var, hx = torch.split(prev_tensor, [n_groups, n_groups, 2 * dim * ndim], dim=-1)
+        prev_mean, prev_var, hx = torch.split(
+            prev_tensor, [n_groups, n_groups, 2 * dim * ndim], dim=-1
+        )
         prev_mean = prev_mean.to(x)
         prev_var = prev_var.to(x)
         hx = _r2c(hx.view(bsz, dim, ndim, 2))
@@ -277,7 +291,9 @@ class MovingAverageGatedAttention(nn.Module):
         x: Tensor,
         freqs_cis: Tensor,
         mask: Optional[Tensor] = None,
-        cache: Optional[Tuple[Tuple[Tensor, Tensor, int], Tuple[Tensor, Tensor, Tensor], Tensor]] = None,
+        cache: Optional[
+            Tuple[Tuple[Tensor, Tensor, int], Tuple[Tensor, Tensor, Tensor], Tensor]
+        ] = None,
     ):
         bsz, seq_len, _ = x.size()
         residual = x
@@ -295,10 +311,14 @@ class MovingAverageGatedAttention(nn.Module):
             cache_attn, cache_norm, hx = None, None, None
 
         # B x L x D
-        out_tsn, prev_count, prev_mean, prev_var = self.timenorm(x, prev_count, prev_mean, prev_var)
+        out_tsn, prev_count, prev_mean, prev_var = self.timenorm(
+            x, prev_count, prev_mean, prev_var
+        )
         # B x D x L
         compute_h = cache_attn is not None or should_send_to_next()
-        out_cema, hx = self.cema(out_tsn.transpose(1, 2), hx, compute_last_state=compute_h)
+        out_cema, hx = self.cema(
+            out_tsn.transpose(1, 2), hx, compute_last_state=compute_h
+        )
 
         if cache is not None:
             cache_norm = (prev_count.detach(), prev_mean.detach(), prev_var.detach())
@@ -348,6 +368,12 @@ class MovingAverageGatedAttention(nn.Module):
         return out, cache
 
     def extra_repr(self) -> str:
-        return 'edim={}, zdim={}, hdim={}, heads={}, chunk={}, eff_attn={}, init={}'.format(self.mdim, self.zdim, self.hdim,
-                                                                                            self.num_heads, self.chunk_size,
-                                                                                            self.efficient_attn, self.init_mode)
+        return "edim={}, zdim={}, hdim={}, heads={}, chunk={}, eff_attn={}, init={}".format(
+            self.mdim,
+            self.zdim,
+            self.hdim,
+            self.num_heads,
+            self.chunk_size,
+            self.efficient_attn,
+            self.init_mode,
+        )

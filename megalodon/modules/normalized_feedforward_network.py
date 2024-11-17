@@ -8,7 +8,7 @@ from megalodon.modules.model_parallel import (
     gather_from_model_parallel_region,
 )
 from .fused_ops import memory_efficient_dropout
-from .layer_norm import FusedLayerNorm
+from .layer_norm import LayerNorm
 from megalodon.utils import get_init_fn
 
 
@@ -23,7 +23,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
         norm_affine=True,
         norm_eps=1e-5,
         rescale=None,
-        init_mode='bert',
+        init_mode="bert",
     ):
         super().__init__()
 
@@ -35,7 +35,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
         self.rescale_init = rescale
         self.init_mode = init_mode
 
-        self.norm = FusedLayerNorm(model_dim, elementwise_affine=norm_affine, eps=norm_eps)
+        self.norm = LayerNorm(model_dim, elementwise_affine=norm_affine, eps=norm_eps)
 
         # layers
         self.fc1 = ColumnParallelLinear(
@@ -54,19 +54,23 @@ class NormalizedFeedForwardNetwork(nn.Module):
             parallel_output=True,
             init_method=get_init_fn(init_mode),
         )
-        self.fc3 = ColumnParallelLinear(
-            model_dim,
-            ffn_hidden_dim,
-            bias=False,
-            input_is_parallel=False,
-            gather_output=False,
-            init_method=get_init_fn(init_mode),
-        ) if self.swiglu else None
+        self.fc3 = (
+            ColumnParallelLinear(
+                model_dim,
+                ffn_hidden_dim,
+                bias=False,
+                input_is_parallel=False,
+                gather_output=False,
+                init_method=get_init_fn(init_mode),
+            )
+            if self.swiglu
+            else None
+        )
 
         if rescale is None:
-            self.register_parameter('alpha', None)
+            self.register_parameter("alpha", None)
         else:
-            assert rescale > 0., 'Layer scale init value should be positive.'
+            assert rescale > 0.0, "Layer scale init value should be positive."
             self.alpha = nn.Parameter(torch.full((model_dim,), rescale))
 
     def rescale(self, x: torch.Tensor) -> torch.Tensor:
@@ -80,10 +84,14 @@ class NormalizedFeedForwardNetwork(nn.Module):
         # fc1 & fc3
         if self.swiglu:
             hidden = F.silu(self.fc1(x)) * self.fc3(x)
-            hidden = memory_efficient_dropout(hidden, self.hidden_dropout, self.training)
+            hidden = memory_efficient_dropout(
+                hidden, self.hidden_dropout, self.training
+            )
         else:
             hidden = F.silu(self.fc1(x))
-            hidden = memory_efficient_dropout(hidden, self.hidden_dropout, self.training)
+            hidden = memory_efficient_dropout(
+                hidden, self.hidden_dropout, self.training
+            )
 
         # fc2
         x = self.fc2(hidden)
@@ -94,5 +102,10 @@ class NormalizedFeedForwardNetwork(nn.Module):
         return out
 
     def extra_repr(self) -> str:
-        return 'dim={}, hdim={}, swiglu={}, init={}, rescale={}'.format(self.model_dim, self.hidden_dim, self.swiglu,
-                                                                        self.init_mode, self.rescale_init)
+        return "dim={}, hdim={}, swiglu={}, init={}, rescale={}".format(
+            self.model_dim,
+            self.hidden_dim,
+            self.swiglu,
+            self.init_mode,
+            self.rescale_init,
+        )
