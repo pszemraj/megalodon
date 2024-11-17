@@ -17,30 +17,32 @@ Discord: [https://discord.gg/Unf8Fa7kWt](https://discord.gg/Unf8Fa7kWt)
 1. [April 15th 2024] Release Repo to public.
 
 ## Installation
-First install PyTorch 2.0.1 with cuda 11.7
+
+First, ensure you have a venv with updated python packaging software:
+
+```sh
+# create and activate your virtual environment if not done so already
+pip install -U pip ninja wheel packaging
+```
+
+Then, install PyTorch 2.0.1 with cuda 11.7[^1]. Alternate (non-Conda) [installation methods can be found here](https://pytorch.org/get-started/previous-versions/#v201) for PyTorch 2.0.1  
+
+[^1]: TBD as to whether the specific CUDA version matters
+
 ```bash
 conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.7 -c pytorch -c nvidia
 ```
 
-Then, install the apex package.
-```bash
-# clone the repo
-git clone https://github.com/NVIDIA/apex.git
-cd apex
+Then, install the fairscale package using either method.
 
-# checkout to the correct verison
-git checkout 23.08
+**method 1:** install with pip
 
-# complie & install
-pip install packaging
-
-# if pip >= 23.1 (ref: https://pip.pypa.io/en/stable/news/#v23-1) which supports multiple `--config-settings` with the same key... 
-pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
-# otherwise
-pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --global-option="--cpp_ext" --global-option="--cuda_ext" ./
+```sh
+pip install git+https://github.com/facebookresearch/fairscale.git@ngoyal_bf16_changes
 ```
 
-Install the fairscale package.
+**method 2:** standard install from source
+
 ```bash
 # clone the repo 
 git clone https://github.com/facebookresearch/fairscale.git
@@ -53,9 +55,10 @@ git checkout ngoyal_bf16_changes
 pip install .
 ```
 
-Finally, install megalodon
+Finally, install megalodon:
+
 ```bash
-https://github.com/XuezheMax/megalodon.git
+git clone https://github.com/pszemraj/megalodon.git
 cd megalodon
 pip install -r requirements.txt
 pip install -e .
