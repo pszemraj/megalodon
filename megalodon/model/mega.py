@@ -272,6 +272,17 @@ def build_model(
 # register some models configurations
 ModelStore = {}
 
+ModelStore["mega50M"] = ModelConf(
+    num_layers=6,
+    model_dim=512,
+    num_heads=1,
+    z_dim=128,
+    value_dim=1024,
+    ffn_hidden_dim=1536,
+    chunk_size=1024,
+    norm_num_groups=16,
+)
+
 ModelStore["mega200M"] = ModelConf(num_layers=12, model_dim=1024, num_heads=1, z_dim=256, value_dim=2048, ffn_hidden_dim=2560,
                                    chunk_size=2048, norm_num_groups=32)
 
