@@ -21,16 +21,36 @@ class Tokenizer:
         self.used_special_tokens = 0
         self.already_tokenized_data = tokenizer_cfg.data_tokenized
 
-        assert tokenizer_cfg.additional_vocab_size % 256 == 0, \
-            f"additional vocab size is not multiple of 256: {tokenizer_cfg.additional_vocab_size}"
+        assert (
+            tokenizer_cfg.additional_vocab_size % 256 == 0
+        ), f"additional vocab size is not multiple of 256: {tokenizer_cfg.additional_vocab_size}"
 
         # BOS / EOS token IDs
-        self.n_words: int = self.sp_model.vocab_size() + tokenizer_cfg.additional_vocab_size
+        self.n_words: int = (
+            self.sp_model.vocab_size() + tokenizer_cfg.additional_vocab_size
+        )
         self._bos_id: Optional[int] = None
         self._eos_id: Optional[int] = None
         self._pad_id: Optional[int] = None
+
+        # Initialize EOS first since we'll use it for padding if needed
+        if self.sp_model.eos_id() != -1:
+            self._eos_id = self.sp_model.eos_id()
+        else:
+            eos_id = self.sp_model_vocab_size + self.used_special_tokens
+            self.used_special_tokens += 1
+            self._eos_id = eos_id
+
+        # If no pad token, use EOS token
+        if self.sp_model.pad_id() == -1:
+            self._pad_id = self.eos_id
+            logger.info(f"Using EOS token (id={self.eos_id}) as padding token")
+
         logger.info(
-            f"#words: {self.n_words} - BOS ID: {self.bos_id} - EOS ID: {self.eos_id} - PAD ID: {self.pad_id}"
+            f"#words: {self.n_words} - "
+            f"BOS ID: {self.bos_id} - "
+            f"EOS ID: {self.eos_id} - "
+            f"PAD ID: {self.pad_id}"
         )
         assert self.sp_model.vocab_size() == self.sp_model.get_piece_size()
 
@@ -89,6 +109,11 @@ class Tokenizer:
     @property
     def pad_id(self) -> int:
         if self._pad_id is not None:
+            return self._pad_id
+
+        # If no explicit pad token, use EOS token
+        if self.sp_model.pad_id() == -1:
+            self._pad_id = self.eos_id
             return self._pad_id
 
         if self.sp_model.pad_id() != -1 or self.additional_vocab_size == 0:
