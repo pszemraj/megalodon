@@ -145,16 +145,27 @@ def pad(
     value: int,
     padding: str = "post",
     truncating: str = "post",
-):
+) -> List[int]:
+    """
+    Pad/truncate a sequence to max_length.
+
+    Args:
+        tokens: Token sequence to pad
+        max_length: Target length
+        value: Padding value
+        padding: 'pre' or 'post' for padding location
+        truncating: 'pre' or 'post' for truncation location
+    """
     if len(tokens) < max_length:
+        pad_length = max_length - len(tokens)
         if padding == "post":
-            tokens = tokens + [value] * (max_length - len(tokens))
+            tokens = tokens + [value] * pad_length
         elif padding == "pre":
-            tokens = [value] * (max_length - len(tokens)) + tokens
-    if truncating == "post":
-        tokens = tokens[:max_length]
-    elif truncating == "pre":
-        if len(tokens) > max_length:
+            tokens = [value] * pad_length + tokens
+    if len(tokens) > max_length:
+        if truncating == "post":
+            tokens = tokens[:max_length]
+        elif truncating == "pre":
             tokens = tokens[len(tokens) - max_length:]
     return tokens
 
