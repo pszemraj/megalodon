@@ -81,7 +81,7 @@ def fused_fftconv_fwd(
     k: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     L = x.size(-1)
-    if not x.is_cuda or L < 32 or L > 16384:
+    if not x.is_cuda or L < 32 or L > 4096: # TODO fix cases between 4096 and 16384
         y, x_f, k_f = _fftconv_fwd(x, k)
     else:
         N = L if (L & (L - 1)) == 0 else (1 << L.bit_length())
@@ -100,7 +100,7 @@ def fused_fftconv_bwd(
     k_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     L = y_grad.size(-1)
-    if not y_grad.is_cuda or L < 32 or L > 16384:
+    if not y_grad.is_cuda or L < 32 or L > 4096: # TODO fix cases between 4096 and 16384
         return _fftconv_bwd(y_grad, x_f, k_f)
     else:
         return fftconv_bwd(y_grad, x_f, k_f, k_dtype)
