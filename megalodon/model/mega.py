@@ -283,6 +283,17 @@ ModelStore["mega50M"] = ModelConf(
     norm_num_groups=16,
 )
 
+ModelStore["mega100M"] = ModelConf(
+    num_layers=8,
+    model_dim=768,
+    num_heads=1,
+    z_dim=192,
+    value_dim=1536,
+    ffn_hidden_dim=2048,
+    chunk_size=2048,
+    norm_num_groups=24
+)
+
 ModelStore["mega200M"] = ModelConf(num_layers=12, model_dim=1024, num_heads=1, z_dim=256, value_dim=2048, ffn_hidden_dim=2560,
                                    chunk_size=2048, norm_num_groups=32)
 
