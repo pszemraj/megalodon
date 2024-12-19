@@ -7,7 +7,6 @@ from pathlib import Path
 
 import fire
 import torch
-import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from megalodon.config import OptimConf, TokenizerConf
@@ -79,36 +78,68 @@ def run_validation(model, val_loader, max_batches: int = 10):
     return total_loss / max(count, 1)
 
 
-@torch.no_grad()
-def top_k_sampling(logits, top_k=10):
-    """
-    Perform top-k sampling from the logits.
-    """
-    if top_k > 0:
-        # Get top K indices
-        values, indices = torch.topk(logits, k=top_k, dim=-1)
-        # Filter out everything not in top k
-        filtered_logits = torch.full_like(logits, float("-inf"))
-        filtered_logits.scatter_(1, indices, values)
-        logits = filtered_logits
-    probs = F.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
+def log(t, eps=1e-20):
+    return torch.log(t.clamp(min=eps))
+
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+
+def gumbel_sample(logits, temperature=1.3, dim=-1):
+    # Add Gumbel noise for sampling
+    gumbel = gumbel_noise(logits)
+    # Scale by temperature
+    return ((logits / max(temperature, 1e-10)) + gumbel).argmax(dim=dim)
+
+
+def min_p_filter(logits, min_p=0.1):
+    # Convert logits to probabilities
+    probs = logits.softmax(dim=-1)
+    # Get the maximum probability in each row
+    max_probs = probs.amax(dim=-1, keepdim=True)
+    # Filter out tokens with probability < min_p * max_prob
+    limit = min_p * max_probs
+    filtered_logits = torch.where(probs < limit, float("-inf"), logits)
+    return filtered_logits
 
 
 @torch.no_grad()
-def generate_from_prompt(model, tokenizer, prompt_tokens, gen_length=100, top_k=10):
+def generate_from_prompt(
+    model, tokenizer, prompt_tokens, gen_length=50, temperature=1.3, min_p=0.1
+):
     """
-    Generate text from a given prompt tokens using top-k sampling.
+    Generate a sequence of tokens using the given model and prompt tokens.
+
+    :param model: The model to use for generation.
+    :param tokenizer: The tokenizer to use for decoding the generated sequence.
+    :param prompt_tokens: The initial tokens to use as input. The model will generate
+        tokens after these tokens.
+    :param gen_length: The number of tokens to generate. Defaults to 50.
+    :param temperature: The temperature to use for Gumbel sampling. Defaults to 1.3.
+    :param min_p: The minimum probability to use for filtering out tokens in the min_p_filter.
+        Defaults to 0.1.
+    :return: The generated text as a string.
     """
     model.eval()
     x = torch.tensor(prompt_tokens, dtype=torch.long, device="cuda").unsqueeze(0)
+
     for _ in range(gen_length):
-        pred, _ = model(x)
-        # Take last token logits
-        logits = pred[:, -1, :]
-        next_token = top_k_sampling(logits, top_k=top_k)
+        # Get logits for the current sequence
+        logits, _ = model(x)
+        logits = logits[:, -1, :]  # Last token logits
+
+        # Apply min_p_filter
+        logits = min_p_filter(logits, min_p=min_p)
+
+        # Sample using Gumbel sampling
+        next_token = gumbel_sample(logits, temperature=temperature).unsqueeze(1)
+
+        # Append next token
         x = torch.cat([x, next_token], dim=1)
-    # Decode
+
+    # Decode the full generated sequence
     out_seq = x[0].tolist()
     text = tokenizer.decode(out_seq, cut_at_eos=False)
     model.train()
@@ -127,8 +158,7 @@ def train(
     save_steps: int = 5000,
     validation_steps: int = 1000,
     generation_steps: int = 2000,
-    gen_length: int = 100,
-    top_k: int = 10,
+    gen_length: int = 50,
     learning_rate: float = 1e-4,
     warmup_steps: int = 500,
     model_parallel_size: int = 1,
@@ -157,8 +187,7 @@ def train(
         save_steps: Save checkpoint every N steps
         validation_steps: Run validation every N steps if validation set exists
         generation_steps: Run generation sanity check every N steps if validation set exists
-        gen_length: Length of generation for sanity check
-        top_k: Top-k for sampling during generation
+        gen_length: Length of generation for sanity check (token count)
         learning_rate: Learning rate
         warmup_steps: Learning rate warmup steps
         model_parallel_size: Model parallel size
@@ -333,7 +362,10 @@ def train(
             prompt_text = tokenizer.decode(prompt_tokens, cut_at_eos=False)
             logger.info(f"\n\n[Generation Step] Prompt:\n{prompt_text}\n{'='*50}")
             generated_text = generate_from_prompt(
-                model, tokenizer, prompt_tokens, gen_length=gen_length, top_k=top_k
+                model,
+                tokenizer,
+                prompt_tokens,
+                gen_length=gen_length,
             )
             logger.info(
                 f"[Generation Step] Generated continuation:\n{generated_text}\n{'='*50}"
