@@ -384,6 +384,7 @@ def train(
 
     # Final save
     save_checkpoint(model, optimizer, scheduler, step, output_dir, is_final=True)
+    tokenizer.sp_model.save(output_dir / "tokenizer.model")
     logger.info("Training completed!")
 
 
