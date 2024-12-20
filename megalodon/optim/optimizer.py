@@ -21,14 +21,17 @@ def rescale_grads(model: nn.Module, scale: float):
         p.grad /= scale
 
 
-def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str):
-    logger.info("Starting build of optimizer...")
+def build_optimizer(
+    model: nn.Module, cfg: OptimConf, total_steps: int, fused: bool = True
+):
+    logger.info(f"Starting build of optimizer: {cfg}")
     optimizer = AdamW(
         model.parameters(),
         lr=cfg.lr,
         betas=(cfg.beta1, cfg.beta2),
         weight_decay=cfg.weight_decay,
         eps=cfg.epsilon,
+        fused=fused,
     )
     # scheduler
     scheduler = build_lr_scheduler(optimizer, cfg, total_steps)
