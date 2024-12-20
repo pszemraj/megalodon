@@ -57,8 +57,8 @@ def save_checkpoint(
 
 
 @torch.no_grad()
-def run_validation(model, val_loader, max_batches: int = 10):
-    """Run validation with proper error handling and accumulation."""
+def run_validation(model, val_loader, max_batches: int = 100):
+    """Run validation with proper token-based loss averaging."""
     model.eval()
     total_loss = 0
     total_tokens = 0
@@ -74,11 +74,14 @@ def run_validation(model, val_loader, max_batches: int = 10):
                 break
 
             pred, _ = model(batch["x"].cuda())
-            # Get loss per token
+            # Sum loss across all tokens
             loss = cross_entropy(pred, batch["y"].cuda())
-            # Sum up losses and count tokens
+            # Count valid tokens (not padding)
+            non_pad_mask = batch["y"].cuda() != -100
+            num_valid = non_pad_mask.sum().item()
+            # Accumulate
             total_loss += loss.sum().item()
-            total_tokens += (batch["y"] != -100).sum().item()
+            total_tokens += num_valid
 
         avg_loss = total_loss / max(total_tokens, 1)
         return avg_loss
@@ -318,19 +321,23 @@ def train(
         try:
             batch = next(train_iter)
         except StopIteration:
-            # Reinit train_iter if needed
             train_iter = iter(train_loader)
             batch = next(train_iter)
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
             pred, _ = model(batch["x"].cuda())
-            loss = cross_entropy(pred, batch["y"].cuda()).mean()
-        loss_value = loss.item()
+            # Sum loss across all tokens
+            loss = cross_entropy(pred, batch["y"].cuda())
+            # Count valid tokens
+            non_pad_mask = batch["y"].cuda() != -100
+            num_valid = non_pad_mask.sum().item()
+            # Get per-token loss for logging
+            loss_value = loss.sum().item() / max(num_valid, 1)
 
-        accumulated_loss += (
-            loss_value / grad_acc_steps
-        )  # Scale the loss when accumulating
-        loss = loss / grad_acc_steps
+        # Scale for gradient accumulation
+        accumulated_loss += loss_value / grad_acc_steps
+        # Scale before backward
+        loss = loss.sum() / max(num_valid, 1) / grad_acc_steps
         loss.backward()
 
         if (step + 1) % grad_acc_steps == 0:
@@ -358,7 +365,7 @@ def train(
             logger.info("Running validation...")
             val_iter = iter(val_loader)
             val_loss = run_validation(model, val_iter, max_batches=100)
-            logger.info(f"Step {step} | Validation Loss: {val_loss:.4f}")
+            logger.info(f"Step {step//grad_acc_steps} | Validation Loss: {val_loss:.4f}")
 
         # Generation step
         if val_loader is not None and (step > 0) and (step % generation_steps == 0):
