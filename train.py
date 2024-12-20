@@ -58,24 +58,33 @@ def save_checkpoint(
 
 @torch.no_grad()
 def run_validation(model, val_loader, max_batches: int = 10):
-    """
-    Run validation to estimate validation loss.
-    We'll take up to `max_batches` batches from val_loader to compute avg loss.
-    """
+    """Run validation with proper error handling and accumulation."""
     model.eval()
     total_loss = 0
-    count = 0
-    for _ in range(max_batches):
-        try:
-            batch = next(val_loader)
-        except StopIteration:
-            break
-        pred, _ = model(batch["x"].cuda())
-        loss = cross_entropy(pred, batch["y"].cuda()).mean().item()
-        total_loss += loss
-        count += 1
-    model.train()
-    return total_loss / max(count, 1)
+    total_tokens = 0
+
+    try:
+        for batch_idx in range(max_batches):
+            try:
+                batch = next(val_loader)
+            except StopIteration:
+                if batch_idx == 0:
+                    logger.warning("Validation dataset is empty!")
+                    return float("inf")
+                break
+
+            pred, _ = model(batch["x"].cuda())
+            # Get loss per token
+            loss = cross_entropy(pred, batch["y"].cuda())
+            # Sum up losses and count tokens
+            total_loss += loss.sum().item()
+            total_tokens += (batch["y"] != -100).sum().item()
+
+        avg_loss = total_loss / max(total_tokens, 1)
+        return avg_loss
+
+    finally:
+        model.train()
 
 
 def log(t, eps=1e-20):
@@ -169,7 +178,7 @@ def train(
     fp32_reduce_scatter: bool = False,
     reshard_after_forward: bool = True,
     distributed_timeout: int = 1800,  # 30 minutes
-    log_every_n_steps: int = 10,
+    log_every_n_steps: int = 8,
 ):
     """
     Train a Megalodon model using distributed infrastructure, with validation & generation checks.
@@ -294,7 +303,7 @@ def train(
 
     # Initialize optimizer and scheduler
     optimizer, scheduler = build_optimizer(
-        model=model, cfg=optim_cfg, total_steps=max_steps, param_dtype=dtype
+        model=model, cfg=optim_cfg, total_steps=max_steps
     )
 
     # Training loop
@@ -318,23 +327,28 @@ def train(
             loss = cross_entropy(pred, batch["y"].cuda()).mean()
         loss_value = loss.item()
 
-        # Backward pass with gradient accumulation
-        (loss / grad_acc_steps).backward()
-        accumulated_loss += loss_value
+        accumulated_loss += (
+            loss_value / grad_acc_steps
+        )  # Scale the loss when accumulating
+        loss = loss / grad_acc_steps
+        loss.backward()
 
         if (step + 1) % grad_acc_steps == 0:
             # Gradient sync and clip
             model.grad_all_reduce()
-            clip_grad_norm_(fsdp_module=model, max_norm=optim_cfg.clip)
+            grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=optim_cfg.clip)
 
+            # Optimizer and scheduler step
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-            avg_loss = accumulated_loss / grad_acc_steps
-            if step % log_every_n_steps == 0:
+            # Log with proper scaling
+            if (step + 1) % log_every_n_steps == 0:
                 logger.info(
-                    f"Step {step} | Loss: {avg_loss:.4f} | "
+                    f"Step {step//grad_acc_steps} | "
+                    f"Loss: {accumulated_loss:.4f} | "
+                    f"Grad norm: {grad_norm:.4f} | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e}"
                 )
             accumulated_loss = 0
@@ -343,7 +357,7 @@ def train(
         if val_loader is not None and (step > 0) and (step % validation_steps == 0):
             logger.info("Running validation...")
             val_iter = iter(val_loader)
-            val_loss = run_validation(model, val_iter, max_batches=10)
+            val_loss = run_validation(model, val_iter, max_batches=100)
             logger.info(f"Step {step} | Validation Loss: {val_loss:.4f}")
 
         # Generation step
