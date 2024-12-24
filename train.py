@@ -1,6 +1,7 @@
 #!/usr/bin/env python
-"""train.py: Train a Megalodon model using distributed training infrastructure, with validation and generation checks."""
+"""train.py: Train a Megalodon model using distributed training infrastructure"""
 
+import itertools
 import logging
 import random
 from pathlib import Path
@@ -57,37 +58,25 @@ def save_checkpoint(
 
 
 @torch.no_grad()
-def run_validation(model, val_loader, max_batches: int = 100):
-    """Run validation with proper token-based loss averaging."""
+def run_validation(model, val_iter, max_batches: int = 100):
+    """
+    Run validation, cycling through data as needed.
+    Uses an infinite iterator to avoid StopIteration.
+    """
     model.eval()
     total_loss = 0
     total_tokens = 0
 
-    try:
-        for batch_idx in range(max_batches):
-            try:
-                batch = next(val_loader)
-            except StopIteration:
-                if batch_idx == 0:
-                    logger.warning("Validation dataset is empty!")
-                    return float("inf")
-                break
+    for _ in range(max_batches):
+        batch = next(val_iter)  # never raises StopIteration
+        pred, _ = model(batch["x"].cuda())
+        loss = cross_entropy(pred, batch["y"].cuda())
+        non_pad_mask = batch["y"].cuda() != -100
+        total_loss += loss.sum().item()
+        total_tokens += non_pad_mask.sum().item()
 
-            pred, _ = model(batch["x"].cuda())
-            # Sum loss across all tokens
-            loss = cross_entropy(pred, batch["y"].cuda())
-            # Count valid tokens (not padding)
-            non_pad_mask = batch["y"].cuda() != -100
-            num_valid = non_pad_mask.sum().item()
-            # Accumulate
-            total_loss += loss.sum().item()
-            total_tokens += num_valid
-
-        avg_loss = total_loss / max(total_tokens, 1)
-        return avg_loss
-
-    finally:
-        model.train()
+    model.train()
+    return total_loss / max(total_tokens, 1)
 
 
 def log(t, eps=1e-20):
@@ -123,16 +112,6 @@ def generate_from_prompt(
 ):
     """
     Generate a sequence of tokens using the given model and prompt tokens.
-
-    :param model: The model to use for generation.
-    :param tokenizer: The tokenizer to use for decoding the generated sequence.
-    :param prompt_tokens: The initial tokens to use as input. The model will generate
-        tokens after these tokens.
-    :param gen_length: The number of tokens to generate. Defaults to 50.
-    :param temperature: The temperature to use for Gumbel sampling. Defaults to 1.3.
-    :param min_p: The minimum probability to use for filtering out tokens in the min_p_filter.
-        Defaults to 0.1.
-    :return: The generated text as a string.
     """
     model.eval()
     x = torch.tensor(prompt_tokens, dtype=torch.long, device="cuda").unsqueeze(0)
@@ -187,28 +166,7 @@ def train(
     Train a Megalodon model using distributed infrastructure, with validation & generation checks.
     Launch with: torchrun --nproc_per_node={NUM_GPUS} train.py [args]
 
-    Args:
-        data_dir: Directory with training data files: train.jsonl and optionally validation.jsonl
-        tokenizer_path: Path to SentencePiece tokenizer
-        model_name: Name of model configuration
-        output_dir: Directory to save checkpoints
-        batch_size: Batch size per GPU
-        grad_acc_steps: Gradient accumulation steps
-        max_seq_length: Maximum sequence length
-        max_steps: Maximum training steps
-        save_steps: Save checkpoint every N steps
-        validation_steps: Run validation every N steps if validation set exists
-        generation_steps: Run generation sanity check every N steps if validation set exists
-        gen_length: Length of generation for sanity check (token count)
-        learning_rate: Learning rate
-        warmup_steps: Learning rate warmup steps
-        model_parallel_size: Model parallel size
-        chunk_parallel_size: Chunk parallel size
-        seed: Random seed
-        dtype: Model dtype (bf16/fp16/fp32)
-        fp32_reduce_scatter: Use FP32 for reduce scatter
-        reshard_after_forward: Reshard parameters after forward pass
-        distributed_timeout: Timeout for distributed operations
+    NOTE: This version wraps dataloaders in infinite iterators to prevent StopIteration.
     """
     # Basic setup
     initialize_logger()
@@ -253,7 +211,7 @@ def train(
     tokenizer = Tokenizer(tokenizer_cfg)
     model_cfg.vocab_size = model_cfg.output_size = tokenizer.sp_model_vocab_size
 
-    # Train dataloader
+    # Train dataloader (wrapped with infinite cycle)
     train_file = Path(data_dir) / "train.jsonl"
     train_loader = DataLoader(
         tokenizer=tokenizer,
@@ -265,13 +223,14 @@ def train(
         max_seq_length=max_seq_length,
         shuffle=True,
     )
-    train_iter = iter(train_loader)
+    # Use itertools.cycle to get an infinite iterator
+    train_iter = itertools.cycle(train_loader)
 
-    # Validation dataloader (optional)
+    # Validation dataloader (optional, also wrapped in infinite cycle)
     val_file = Path(data_dir) / "validation.jsonl"
     val_loader = None
+    val_iter = None
     if val_file.is_file():
-        # If validation exists, load it
         val_loader_obj = DataLoader(
             tokenizer=tokenizer,
             path=str(val_file),
@@ -281,14 +240,14 @@ def train(
             chunk_size=model_cfg.chunk_size,
             max_seq_length=max_seq_length,
         )
-        val_iter = iter(val_loader_obj)
-        # We'll re-init the val_iter each time we run validation
-        # or just continuously iterate
-        # For validation and generation prompt extraction, we can re-instantiate when needed
+        # Infinite iterator for validation data
+        val_iter_obj = itertools.cycle(val_loader_obj)
+
         logger.info(
             "Validation file found. Will run periodic validation and generation checks."
         )
         val_loader = val_loader_obj
+        val_iter = val_iter_obj
     else:
         logger.info(
             "No validation file found. Skipping validation and generation steps."
@@ -318,11 +277,8 @@ def train(
     pbar = tqdm(total=max_steps, mininterval=10, desc="Training")
 
     while step < max_steps:
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
+        # Grab next batch from infinite iterator
+        batch = next(train_iter)
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
             pred, _ = model(batch["x"].cuda())
@@ -331,26 +287,26 @@ def train(
             # Count valid tokens
             non_pad_mask = batch["y"].cuda() != -100
             num_valid = non_pad_mask.sum().item()
-            # Get per-token loss for logging
+            # Per-token loss for logging
             loss_value = loss.sum().item() / max(num_valid, 1)
 
-        # Scale for gradient accumulation
+        # Accumulate
         accumulated_loss += loss_value / grad_acc_steps
-        # Scale before backward
+        # Scale for gradient accumulation
         loss = loss.sum() / max(num_valid, 1) / grad_acc_steps
         loss.backward()
 
+        # Gradient accumulation boundary
         if (step + 1) % grad_acc_steps == 0:
-            # Gradient sync and clip
+            # Sync and clip
             model.grad_all_reduce()
             grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=optim_cfg.clip)
 
-            # Optimizer and scheduler step
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-            # Log with proper scaling
+            # Logging
             if (step + 1) % log_every_n_steps == 0:
                 logger.info(
                     f"Step {step//grad_acc_steps} | "
@@ -361,21 +317,28 @@ def train(
             accumulated_loss = 0
 
         # Validation step
-        if val_loader is not None and (step > 0) and (step % validation_steps == 0):
+        if (
+            val_loader is not None
+            and val_iter is not None
+            and (step > 0)
+            and (step % validation_steps == 0)
+        ):
             logger.info("Running validation...")
-            val_iter = iter(val_loader)
             val_loss = run_validation(model, val_iter, max_batches=100)
-            logger.info(f"Step {step//grad_acc_steps} | Validation Loss: {val_loss:.4f}")
+            logger.info(
+                f"Step {step//grad_acc_steps} | Validation Loss: {val_loss:.4f}"
+            )
 
         # Generation step
-        if val_loader is not None and (step > 0) and (step % generation_steps == 0):
-            # We'll pick a random line from validation set to use as prompt
-            # For simplicity, re-iterate val_loader_obj into memory for a single example
-            val_iter = iter(val_loader)
-            val_batch = next(val_iter)
-            # pick a random sequence from val_batch
-            x_tokens = val_batch["x"][0].tolist()
-            # pick a random start index for a small prompt
+        if (
+            val_loader is not None
+            and val_iter is not None
+            and (step > 0)
+            and (step % generation_steps == 0)
+        ):
+            # Grab a batch from val to build a prompt
+            batch = next(val_iter)
+            x_tokens = batch["x"][0].tolist()
             prompt_length = min(50, len(x_tokens))
             start_idx = random.randint(0, max(0, len(x_tokens) - prompt_length - 1))
             prompt_tokens = x_tokens[start_idx : start_idx + prompt_length]
