@@ -546,6 +546,44 @@ The `megalodon_extension` module exposes 7 custom operations (from `megalodon/cs
 | **AttentionSoftmax** | None | `csrc/ops/attention_softmax*` | Unused |
 | **SequenceNorm** | None | `csrc/ops/sequence_norm*` | Unused |
 
+#### Overall Kernel Architecture
+
+```mermaid
+graph TB
+    subgraph "MEGA Forward Pass"
+        Input[Input x<br/>B x L x D]
+        TSN[TimestepNorm<br/>Running Stats]
+        CEMA[CEMA Module]
+        Attn[Attention]
+        Output[Output]
+    end
+
+    subgraph "CEMA Components"
+        EMASRC[EMA Parameters<br/>Build Kernel]
+        FFT[FFTConv<br/>Apply Kernel]
+        EMAHID[EMA Hidden<br/>Final State]
+    end
+
+    subgraph "Attention Components"
+        SWIFT[Swift Attention<br/>Fused Tiling]
+    end
+
+    Input --> TSN
+    TSN --> CEMA
+    CEMA --> EMASRC
+    EMASRC --> FFT
+    FFT --> EMAHID
+    CEMA --> Attn
+    Attn --> SWIFT
+    SWIFT --> Output
+
+    style TSN fill:#e1f5ff
+    style EMASRC fill:#ffe1f5
+    style FFT fill:#ffe1f5
+    style EMAHID fill:#ffe1f5
+    style SWIFT fill:#f5ffe1
+```
+
 ### 1. TimestepNorm Kernel
 
 **Purpose**: Compute running mean and variance across sequence timesteps with group normalization.
@@ -598,6 +636,42 @@ GroupTimestepNormFwd(
 - `cumrstd`: Cumulative reciprocal std at each timestep [B, L, G]
 - Does not save normalized output or intermediate deltas
 
+#### Welford's Algorithm Flow
+
+```mermaid
+flowchart TD
+    Start([Start: t=0<br/>count=prev_count<br/>mean=prev_mean<br/>var=prev_var])
+    Input[Read x_t]
+    Inc[count = count + 1]
+    Delta1[delta1 = x_t - mean]
+    Mean[mean = mean + delta1/count]
+    Delta2[delta2 = x_t - mean]
+    M2[M2 = M2 + delta1 * delta2]
+    Var[var = M2 / count]
+    Norm[y_t = gamma * x_t - mean / sqrt var + eps + beta]
+    Save[Save cummean_t, cumrstd_t]
+    Check{More<br/>timesteps?}
+    End([End])
+
+    Start --> Input
+    Input --> Inc
+    Inc --> Delta1
+    Delta1 --> Mean
+    Mean --> Delta2
+    Delta2 --> M2
+    M2 --> Var
+    Var --> Norm
+    Norm --> Save
+    Save --> Check
+    Check -->|Yes| Input
+    Check -->|No| End
+
+    style Start fill:#e1f5ff
+    style Norm fill:#ffe1e1
+    style Save fill:#e1ffe1
+    style End fill:#e1f5ff
+```
+
 ### 2. EMA Hidden State Kernel
 
 **Purpose**: Compute final hidden state of complex EMA after processing sequence.
@@ -642,6 +716,35 @@ std::tuple<torch::Tensor, torch::Tensor> EMAHiddenFwd(
 - Uses shared memory for Vandermonde matrix
 - Warp-level primitives for reduction
 - Processes multiple batches/dimensions in parallel
+
+#### EMA Recurrence Computation
+
+```mermaid
+flowchart LR
+    subgraph "Sequence Processing"
+        X0[x_0] --> H0[h_0 = p*x_0 + q*hx]
+        X1[x_1] --> H1[h_1 = p*x_1 + q*h_0]
+        X2[x_2] --> H2[h_2 = p*x_2 + q*h_1]
+        Xn[x_n] --> Hn[h_n = p*x_n + q*h_n-1]
+
+        H0 -.->|q| H1
+        H1 -.->|q| H2
+        H2 -.->|...| Hn
+    end
+
+    subgraph "Vandermonde Optimization"
+        V[Vandermonde<br/>Matrix V]
+        V --> |q^0, q^1, ..., q^n| Batch[Batch Process<br/>Multiple Powers]
+    end
+
+    HX[Initial State hx] -.->|q^0| H0
+
+    style H0 fill:#ffe1f5
+    style H1 fill:#ffe1f5
+    style H2 fill:#ffe1f5
+    style Hn fill:#e1f5ff
+    style V fill:#f5ffe1
+```
 
 ### 3. EMA Parameters Kernel
 
@@ -698,6 +801,50 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> EMAParametersFwd(
 - Converts to linear space only when needed: `q = exp(log_q)`
 - Kahan summation for reducing across `n` dimension
 
+#### Kernel Construction Pipeline
+
+```mermaid
+flowchart TD
+    subgraph "Inputs"
+        P[p: Input Coeff<br/>D x N x 1]
+        Q[log_q: Decay Coeff<br/>D x N x 1]
+        G[gamma: Projection<br/>D x N complex]
+        HX[hx: Initial State<br/>B x D x N optional]
+    end
+
+    subgraph "Vandermonde Construction"
+        V0[vander_0 = 1]
+        V1[vander_t = vander_t-1 * q]
+        VM[Vandermonde Matrix<br/>D x N x L]
+    end
+
+    subgraph "Kernel Computation"
+        MatMul[k = gamma @ vander<br/>D x L]
+        ElemMul[k = k * p]
+        Kernel[Convolution Kernel<br/>D x L]
+    end
+
+    subgraph "Bias from Initial State"
+        BiasCalc[bias = gamma @ hx<br/>B x D]
+    end
+
+    Q --> |exp| V0
+    V0 --> V1
+    V1 --> VM
+    G --> MatMul
+    VM --> MatMul
+    MatMul --> ElemMul
+    P --> ElemMul
+    ElemMul --> Kernel
+
+    HX --> BiasCalc
+    G --> BiasCalc
+
+    style Kernel fill:#ffe1e1
+    style BiasCalc fill:#ffe1e1
+    style VM fill:#f5ffe1
+```
+
 ### 4. FFTConv Kernel
 
 **Purpose**: Apply convolution via FFT for O(L log L) complexity.
@@ -746,6 +893,54 @@ Where `flip` reverses the sequence (correlation = flipped convolution).
 - Else: Use custom CUDA kernel
 
 This explains the 16384 max length mentioned in docs.
+
+#### FFT Convolution Pipeline
+
+```mermaid
+flowchart LR
+    subgraph "Time Domain"
+        X[x: Input<br/>B x D x L]
+        K[k: Kernel<br/>D x L]
+        Y[y: Output<br/>B x D x L]
+    end
+
+    subgraph "Padding"
+        XP[x_pad: Padded<br/>B x D x 2N]
+        KP[k_pad: Padded<br/>D x 2N]
+    end
+
+    subgraph "Frequency Domain"
+        XF[X_f = FFT x_pad<br/>B x D x N+1 complex]
+        KF[K_f = FFT k_pad<br/>D x N+1 complex]
+        YF[Y_f = X_f * K_f<br/>B x D x N+1 complex]
+    end
+
+    subgraph "Custom FFT Small L ≤ 256"
+        CFFT[Radix-2 FFT<br/>Twiddle LUT<br/>Register-based]
+    end
+
+    subgraph "cuFFT Large L > 256"
+        CUFFT[cuFFT Library<br/>Real-to-Complex<br/>Batched]
+    end
+
+    X --> |Pad to 2N| XP
+    K --> |Pad to 2N| KP
+    XP --> |If small| CFFT
+    XP --> |If large| CUFFT
+    KP --> |If small| CFFT
+    KP --> |If large| CUFFT
+    CFFT --> XF
+    CFFT --> KF
+    CUFFT --> XF
+    CUFFT --> KF
+    XF --> YF
+    KF --> YF
+    YF --> |iFFT| Y
+
+    style Y fill:#ffe1e1
+    style CFFT fill:#f5ffe1
+    style CUFFT fill:#e1f5ff
+```
 
 ### 5. Attention Kernel (Swift)
 
@@ -821,6 +1016,74 @@ std::tuple<torch::Tensor, torch::Tensor> AttentionCUDAFwd(
 - No sequence-parallel reduction
 - Fewer tuning parameters
 - Adequate for Megalodon's chunk-local attention (max 2048 tokens)
+
+#### Attention Tiling Strategy
+
+```mermaid
+graph TD
+    subgraph "Memory Layout"
+        Q[Q Matrix<br/>L x D<br/>Split into Q tiles]
+        K[K Matrix<br/>L x D<br/>Split into K tiles]
+        V[V Matrix<br/>L x Dv<br/>Split into V tiles]
+    end
+
+    subgraph "Tiled Computation"
+        QT[Q Tile<br/>Bq x Dq<br/>Shared Memory]
+        KT[K Tile<br/>Bk x Dk<br/>Shared Memory]
+        VT[V Tile<br/>Bk x Dv<br/>Shared Memory]
+
+        S[Scores = Q @ K^T<br/>Bq x Bk<br/>Registers]
+        SM[Softmax Scores<br/>Online Algorithm<br/>Registers]
+        OUT[Output += SM @ V<br/>Accumulate<br/>Registers]
+    end
+
+    subgraph "Online Softmax"
+        MAX[Track max_i]
+        SUM[Track sum_i]
+        RESCALE[Rescale previous<br/>acc and sum]
+        ADD[Add new<br/>contribution]
+    end
+
+    Q --> QT
+    K --> KT
+    V --> VT
+
+    QT --> S
+    KT --> S
+    S --> MAX
+    MAX --> RESCALE
+    RESCALE --> SUM
+    SUM --> ADD
+    ADD --> SM
+    SM --> OUT
+    VT --> OUT
+
+    style QT fill:#e1f5ff
+    style KT fill:#e1f5ff
+    style VT fill:#e1f5ff
+    style S fill:#ffe1f5
+    style SM fill:#f5ffe1
+    style OUT fill:#ffe1e1
+```
+
+**Tiling Visualization**:
+
+```
+Q Matrix (L x D):           K Matrix (L x D):
+┌─────┬─────┬─────┐        ┌─────┬─────┬─────┐
+│ Q0  │ Q1  │ Q2  │        │ K0  │ K1  │ K2  │
+├─────┼─────┼─────┤        ├─────┼─────┼─────┤
+│ Q3  │ Q4  │ Q5  │        │ K3  │ K4  │ K5  │
+└─────┴─────┴─────┘        └─────┴─────┴─────┘
+
+For Q0:
+  - Load Q0 into shared memory
+  - For each K tile (K0, K1, K2, ...):
+      Load K tile, V tile
+      Compute scores, softmax, matmul
+      Accumulate to output
+  - Final output for Q0 rows
+```
 
 ### 6. Attention Softmax Kernel (Unused)
 
@@ -1040,6 +1303,56 @@ NVCC:
 
 **Source files**: All `.cc` and `.cu` files in `csrc/` and `csrc/ops/`
 
+#### Build System Flow
+
+```mermaid
+flowchart TD
+    subgraph "Python Setup"
+        SETUP[setup.py<br/>Defines extension]
+        SOURCES[Source Files<br/>*.cc, *.cu]
+        HEADERS[Header Files<br/>*.h, *.cuh]
+    end
+
+    subgraph "Compilation"
+        GCC[GCC Compiler<br/>C++ files<br/>-O3 -std=c++17]
+        NVCC[NVCC Compiler<br/>CUDA files<br/>--expt-relaxed-constexpr]
+    end
+
+    subgraph "Linking"
+        OBJS[Object Files<br/>*.o]
+        TORCH[Link with<br/>PyTorch libs]
+        CUDA_LIBS[Link with<br/>CUDA/cuBLAS/cuFFT]
+    end
+
+    subgraph "Python Module"
+        SO[megalodon_extension.so<br/>Shared library]
+        PYBIND[PyBind11 bindings<br/>Python-callable ops]
+        IMPORT[import megalodon_extension.ops]
+    end
+
+    SETUP --> SOURCES
+    SETUP --> HEADERS
+    SOURCES --> |*.cc| GCC
+    SOURCES --> |*.cu| NVCC
+    HEADERS --> GCC
+    HEADERS --> NVCC
+
+    GCC --> OBJS
+    NVCC --> OBJS
+    OBJS --> TORCH
+    TORCH --> CUDA_LIBS
+    CUDA_LIBS --> SO
+
+    SO --> PYBIND
+    PYBIND --> IMPORT
+
+    style SETUP fill:#e1f5ff
+    style GCC fill:#ffe1f5
+    style NVCC fill:#ffe1f5
+    style SO fill:#e1ffe1
+    style IMPORT fill:#f5ffe1
+```
+
 ### Dispatch Pattern
 
 Most kernels follow this pattern:
@@ -1067,7 +1380,112 @@ C++: ops/timestep_norm.cc:GroupTimestepNormFwd()
 CUDA: ops/timestep_norm_kernel.cu:GroupTimestepNormCUDAFwdKernel<<<>>>()
 ```
 
+#### Dispatch Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant PY as Python Layer<br/>timestep_norm.py
+    participant AG as PyTorch Autograd<br/>Function
+    participant CPP as C++ Dispatcher<br/>timestep_norm.cc
+    participant CUDA as CUDA Kernel<br/>timestep_norm_kernel.cu
+    participant GPU as GPU Device
+
+    PY->>AG: Call forward(x, prev_count, ...)
+    AG->>CPP: megalodon_ops.group_timestep_norm_fwd(...)
+    CPP->>CPP: Validate inputs<br/>(dtype, shape, device)
+
+    alt x.is_cuda()
+        CPP->>CUDA: GroupTimestepNormCUDAFwdKernel<<<grid, block>>>
+        CUDA->>GPU: Launch kernel
+        GPU->>GPU: Process tiles in parallel<br/>Compute Welford stats
+        GPU-->>CUDA: Return results
+        CUDA-->>CPP: y, count, mean, var, cummean, cumrstd
+    else x.is_cpu()
+        CPP->>CPP: GroupTimestepNormCPUFwd()
+        CPP->>CPP: Sequential processing
+        CPP-->>CPP: y, count, mean, var, cummean, cumrstd
+    end
+
+    CPP-->>AG: Return tensors
+    AG->>AG: Save for backward:<br/>cummean, cumrstd, gamma
+    AG-->>PY: Return y, count, mean, var
+
+    Note over PY,GPU: Backward pass follows<br/>similar dispatch pattern
+```
+
 ---
+
+## Complete CEMA Pipeline
+
+This diagram shows how all EMA-related kernels work together:
+
+```mermaid
+graph TB
+    subgraph "Input"
+        X[Input Sequence x<br/>B x D x L]
+        HX[Initial State hx<br/>B x D x N complex]
+    end
+
+    subgraph "CEMA Forward Pass"
+        direction TB
+        COEFFS[Compute Coefficients<br/>p, q, gamma from<br/>alpha, delta, theta]
+
+        subgraph "EMA Parameters Kernel"
+            VANDER[Build Vandermonde<br/>q^0, q^1, ..., q^L-1]
+            KERNEL[Compute Kernel<br/>k = gamma @ vander * p]
+            BIAS[Compute Bias<br/>b = gamma @ hx]
+        end
+
+        subgraph "FFTConv Kernel"
+            FFT1[FFT input x]
+            FFT2[FFT kernel k]
+            MUL[Multiply in<br/>frequency domain]
+            IFFT[Inverse FFT]
+        end
+
+        subgraph "EMA Hidden Kernel"
+            REC[Recurrence:<br/>h_t = p*x_t + q*h_t-1]
+            FINAL[Final State h_L]
+        end
+
+        RESIDUAL[Add Residual<br/>output + omega * x]
+    end
+
+    subgraph "Output"
+        OUT[Output y<br/>B x D x L]
+        HOUT[Final State<br/>B x D x N complex]
+    end
+
+    X --> COEFFS
+    HX --> COEFFS
+    COEFFS --> VANDER
+    VANDER --> KERNEL
+    HX --> BIAS
+
+    X --> FFT1
+    KERNEL --> FFT2
+    FFT1 --> MUL
+    FFT2 --> MUL
+    MUL --> IFFT
+    BIAS --> IFFT
+    IFFT --> RESIDUAL
+
+    X --> REC
+    HX --> REC
+    COEFFS --> REC
+    REC --> FINAL
+
+    RESIDUAL --> OUT
+    FINAL --> HOUT
+
+    style VANDER fill:#ffe1f5
+    style KERNEL fill:#ffe1f5
+    style FFT1 fill:#e1f5ff
+    style FFT2 fill:#e1f5ff
+    style MUL fill:#f5ffe1
+    style REC fill:#ffe1e1
+    style OUT fill:#e1ffe1
+```
 
 ## Why Custom Kernels?
 
