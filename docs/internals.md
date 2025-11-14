@@ -525,3 +525,570 @@ Several tricks ensure stable training:
 3. **RMSNorm on Q/K**: Normalizes per-head before attention to prevent extreme scales
 4. **Learned scaling** (`gamma`, `beta`): Allows model to control Q/K magnitude
 5. **FP32 reduce-scatter** option in FSDP: Accumulates gradients in FP32 despite BF16 training
+
+---
+
+## Complete CUDA Kernel Reference
+
+This section documents all custom CUDA kernels in detail.
+
+### Kernel Catalog
+
+The `megalodon_extension` module exposes 7 custom operations (from `megalodon/csrc/megalodon_extension.cc`):
+
+| Operation | Python Wrapper | CUDA Implementation | Status |
+|-----------|---------------|---------------------|---------|
+| **TimestepNorm** | `megalodon/modules/timestep_norm.py` | `csrc/ops/timestep_norm*` | Used |
+| **EMAHidden** | `megalodon/modules/fused_ops/ema_hidden.py` | `csrc/ops/ema_hidden*` | Used |
+| **EMAParameters** | `megalodon/modules/fused_ops/ema_parameters.py` | `csrc/ops/ema_parameters*` | Used |
+| **FFTConv** | `megalodon/modules/fused_ops/fftconv.py` | `csrc/ops/fftconv*` | Used |
+| **Attention** | `megalodon/modules/fused_ops/attention/swift.py` | `csrc/ops/attention*` | Used |
+| **AttentionSoftmax** | None | `csrc/ops/attention_softmax*` | Unused |
+| **SequenceNorm** | None | `csrc/ops/sequence_norm*` | Unused |
+
+### 1. TimestepNorm Kernel
+
+**Purpose**: Compute running mean and variance across sequence timesteps with group normalization.
+
+**C++ Signature** (`csrc/ops/timestep_norm.h`):
+```cpp
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor>
+GroupTimestepNormFwd(
+    const torch::Tensor& x,               // [B, L, D]
+    const torch::Tensor& prev_count,      // [B]
+    const torch::Tensor& prev_mean,       // [B, G]
+    const torch::Tensor& prev_var,        // [B, G]
+    const torch::Tensor& gamma,           // [D]
+    const torch::Tensor& beta,            // [D]
+    const torch::Tensor& padding_mask,    // [B, L] or empty
+    int64_t num_groups,
+    double eps
+);
+```
+
+**Algorithm** (`csrc/ops/timestep_norm_kernel.cu`):
+
+1. **Welford's online algorithm** for mean/variance:
+   ```
+   For each timestep t:
+     count_t = count_{t-1} + 1
+     delta = x_t - mean_{t-1}
+     mean_t = mean_{t-1} + delta / count_t
+     M2_t = M2_{t-1} + delta * (x_t - mean_t)
+     var_t = M2_t / count_t
+   ```
+
+2. **Group-wise statistics**: Features split into `num_groups`, each with independent stats
+
+3. **Normalization**:
+   ```
+   y_t = gamma * (x_t - mean_t) / sqrt(var_t + eps) + beta
+   ```
+
+4. **Cumulative stats**: Stores `cummean[t]`, `cumrstd[t]` for backward pass
+
+**Numerical stability**:
+- Welford's algorithm avoids catastrophic cancellation
+- Uses Kahan summation for accumulating across groups
+- Computes reciprocal std once and reuses: `rstd = 1 / sqrt(var + eps)`
+
+**Memory saved for backward**:
+- `cummean`: Cumulative mean at each timestep [B, L, G]
+- `cumrstd`: Cumulative reciprocal std at each timestep [B, L, G]
+- Does not save normalized output or intermediate deltas
+
+### 2. EMA Hidden State Kernel
+
+**Purpose**: Compute final hidden state of complex EMA after processing sequence.
+
+**C++ Signature** (`csrc/ops/ema_hidden.h`):
+```cpp
+std::tuple<torch::Tensor, torch::Tensor> EMAHiddenFwd(
+    const torch::Tensor& x,        // [B, D, L] - input sequence
+    const torch::Tensor& p,        // [D, N, 1] - real input coefficient
+    const torch::Tensor& log_q,    // [D, N, 1] - log of decay coefficient
+    const torch::Tensor& hx        // [B, D, N] - initial hidden state (complex)
+);
+// Returns: (h, v) where h = final hidden state, v = Vandermonde matrix
+```
+
+**Algorithm**:
+
+1. **Recurrence relation**:
+   ```
+   h[0] = hx (if provided, else 0)
+   For t = 1 to L:
+     h[t] = p * x[t] + q * h[t-1]
+   ```
+   Where `p`, `q` are complex numbers, `x` is real.
+
+2. **Chunked processing**:
+   - Processes sequence in blocks of 64-256 timesteps
+   - Uses Vandermonde matrix to batch-compute powers of q: `[q^0, q^1, ..., q^n]`
+   - Applies prefix sum with complex multiplication
+
+3. **Complex arithmetic**:
+   - Uses `c10::complex<float>` for complex numbers
+   - Fused multiply-add: `h = p * x + q * h_prev`
+   - Stores in view-as-real format: `[..., 2]` where last dim is `[real, imag]`
+
+**Backward pass**:
+- Reverse-mode recurrence: `grad_h[t-1] = q * grad_h[t]`
+- Gradients for p, q computed via chain rule
+- Vandermonde matrix reused from forward pass
+
+**Optimizations**:
+- Uses shared memory for Vandermonde matrix
+- Warp-level primitives for reduction
+- Processes multiple batches/dimensions in parallel
+
+### 3. EMA Parameters Kernel
+
+**Purpose**: Compute convolution kernel and bias from EMA coefficients.
+
+**C++ Signature** (`csrc/ops/ema_parameters.h`):
+```cpp
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> EMAParametersFwd(
+    const torch::Tensor& p,        // [D, N, 1]
+    const torch::Tensor& log_q,    // [D, N, 1]
+    const torch::Tensor& gamma,    // [D, N] (complex)
+    const torch::Tensor& hx,       // [B, D, N] (complex) or empty
+    int64_t length
+);
+// Returns: (weight, bias, vander)
+// weight: [D, L] - convolution kernel
+// bias: [B, D] or empty - contribution from initial state
+// vander: [D, N, L] - Vandermonde matrix for backward
+```
+
+**Algorithm**:
+
+1. **Kernel computation**:
+   ```
+   k[t] = sum_n gamma[n] * p[n] * q[n]^t   for t = 0 to L-1
+   ```
+   This is the impulse response of the EMA filter.
+
+2. **Vandermonde matrix**:
+   ```
+   vander[n, t] = q[n]^t
+   ```
+   Computed efficiently using recurrence: `vander[t] = vander[t-1] * q`
+
+3. **Matrix multiplication**:
+   ```
+   k = gamma @ vander  # [D, N] @ [D, N, L] -> [D, L]
+   k = k * p           # Element-wise multiply
+   ```
+
+4. **Bias from initial state**:
+   ```
+   If hx is provided:
+     bias[b, d] = sum_n gamma[n] * hx[b, d, n]
+   ```
+
+**Why this works**:
+- EMA recurrence can be unrolled into a convolution
+- The kernel is exponentially decaying (since |q| < 1)
+- FFT convolution in next step applies this kernel efficiently
+
+**Numerical stability**:
+- Works in log-space for q (`log_q`) to avoid underflow
+- Converts to linear space only when needed: `q = exp(log_q)`
+- Kahan summation for reducing across `n` dimension
+
+### 4. FFTConv Kernel
+
+**Purpose**: Apply convolution via FFT for O(L log L) complexity.
+
+**C++ Signature** (`csrc/ops/fftconv.h`):
+```cpp
+std::tuple<torch::Tensor, torch::Tensor> FFTConvFwd(
+    const torch::Tensor& x,        // [B, D, L]
+    const torch::Tensor& k_f       // [D, N_fft] (complex) - already FFT'd kernel
+);
+// Returns: (y, x_f) where y = output, x_f = FFT of x (for backward)
+```
+
+**Algorithm**:
+
+1. **Padding**: Pad sequence to 2*N where N is next power of 2 ≥ L
+   - This prevents circular convolution artifacts
+
+2. **Forward FFT**: `X = FFT(x)` using cuFFT
+   - Real-to-complex FFT (saves memory)
+   - Batched across B and D dimensions
+
+3. **Pointwise multiply**: `Y = X * K`
+   - Element-wise complex multiplication
+   - K is already in frequency domain
+
+4. **Inverse FFT**: `y = IFFT(Y)`
+   - Complex-to-real iFFT
+   - Truncate to original length L
+
+**Optimizations** (`csrc/fft.cuh`):
+- **Custom FFT for small sizes**: For L ≤ 256, uses hand-coded FFT kernel (faster than cuFFT)
+- **Twiddle factor lookup**: Precomputed twiddle factors in LUT (`twiddle_factor_lut.cuh`)
+- **Register-based computation**: Small FFTs computed entirely in registers
+- **Shared memory**: Larger FFTs use shared memory for transpose
+
+**Backward pass**:
+```
+grad_x = IFFT(FFT(flip(grad_y)) * K)
+grad_k = IFFT(FFT(flip(grad_y)) * X)
+```
+Where `flip` reverses the sequence (correlation = flipped convolution).
+
+**Dispatch logic** (`megalodon/modules/fused_ops/fftconv.py:79-93`):
+- If `not x.is_cuda` or `L < 32` or `L > 16384`: Use PyTorch FFT
+- Else: Use custom CUDA kernel
+
+This explains the 16384 max length mentioned in docs.
+
+### 5. Attention Kernel (Swift)
+
+**Purpose**: Flash-attention-style fused attention with memory efficiency.
+
+**C++ Signature** (`csrc/ops/attention.h`):
+```cpp
+std::tuple<torch::Tensor, torch::Tensor> AttentionCUDAFwd(
+    const torch::Tensor& q,           // [B, L, H, D]
+    const torch::Tensor& k,           // [B, L, H, D]
+    const torch::Tensor& v,           // [B, L, H, Dv]
+    double scale,                     // 1.0 typically
+    double dropout,
+    bool use_causal_mask
+);
+// Returns: (output, attention_weights)
+// attention_weights only computed if dropout > 0 (for backward)
+```
+
+**Algorithm** (`csrc/ops/attention_kernel.cu`):
+
+1. **Tiling**:
+   - Q split into blocks of size `[Bq, Dq]` (typically 64x64)
+   - K, V split into blocks of size `[Bk, Dk]`
+   - Processes Q tiles in outer loop, K tiles in inner loop
+
+2. **Per-tile computation**:
+   ```
+   For each Q tile:
+     Load Q tile into shared memory
+     For each K tile:
+       Load K, V tiles into shared memory
+       Compute S = Q @ K^T in registers
+       Apply scaling and optional causal mask
+       Compute softmax(S) using online algorithm
+       Accumulate: out += softmax(S) @ V
+   ```
+
+3. **Online softmax**:
+   ```
+   For each row of Q:
+     max = -inf, sum = 0, acc = 0
+     For each K tile:
+       scores = Q[row] @ K^T
+       new_max = max(max, max(scores))
+       # Rescale previous accumulator
+       acc *= exp(max - new_max)
+       sum *= exp(max - new_max)
+       # Add new contribution
+       acc += exp(scores - new_max) @ V
+       sum += sum(exp(scores - new_max))
+       max = new_max
+     # Final normalization
+     out = acc / sum
+   ```
+
+4. **Causal masking**:
+   - When `use_causal_mask=True`, skip K tiles where `col_idx > row_idx`
+   - Apply mask within tile by setting scores to `-inf` before softmax
+
+**Memory complexity**:
+- Does not materialize full `[B, H, L, L]` attention matrix
+- Only stores one tile at a time in shared memory
+- Total memory: O(L) instead of O(L²)
+
+**Backward pass**:
+- Recomputes forward pass on-the-fly (activation recomputation)
+- Computes gradients tile-by-tile
+- Uses same tiling strategy as forward
+
+**Differences from FlashAttention-2**:
+- Uses simpler tiling (no work partitioning across warps)
+- No sequence-parallel reduction
+- Fewer tuning parameters
+- Adequate for Megalodon's chunk-local attention (max 2048 tokens)
+
+### 6. Attention Softmax Kernel (Unused)
+
+**Purpose**: Fused attention with explicit softmax computation.
+
+**Status**: Python wrapper exists (`megalodon/modules/fused_ops/attention/softmax.py`) but is never imported or used. The model uses `swift_efficient_attention` instead.
+
+**Implementation**: Similar to regular attention kernel but always materializes softmax output for debugging.
+
+### 7. Sequence Norm Kernel (Unused)
+
+**Purpose**: Alternative to TimestepNorm, possibly layer normalization across sequence.
+
+**Status**: CUDA implementation exists (`csrc/ops/sequence_norm*`) but no Python wrapper. Not registered in the module's `__init__.py`.
+
+**Speculation**: May have been an earlier normalization scheme that was replaced by TimestepNorm.
+
+---
+
+## Utility Headers and Infrastructure
+
+The kernels rely on several utility headers that provide common functionality.
+
+### Welford's Algorithm (`csrc/welford.h`)
+
+**Purpose**: Numerically stable online computation of mean and variance.
+
+**Data structure**:
+```cpp
+template <typename T>
+struct WelfordData {
+  int64_t m0 = 0;  // Count
+  T m1 = T(0);     // Mean
+  T m2 = T(0);     // Sum of squared deviations
+};
+```
+
+**Update rule**:
+```cpp
+data += x:
+  m0 += 1
+  delta1 = x - m1
+  m1 += delta1 / m0
+  delta2 = delta1 * (x - m1) - m2
+  m2 += delta2 / m0
+```
+
+**Variance**: `var = m2 / m0`
+
+**Why stable**: Avoids `E[x²] - E[x]²` formula which suffers from catastrophic cancellation.
+
+**Used in**: TimestepNorm, SequenceNorm
+
+### Kahan Summation (`csrc/kahan.h`)
+
+**Purpose**: Compensated summation to reduce numerical error in accumulation.
+
+**Algorithm**:
+```cpp
+KahanAdd(x, sum, compensation):
+  y = x - compensation
+  t = sum + y
+  compensation = (t - sum) - y
+  return (t, compensation)
+```
+
+**Error bound**: O(ε) instead of O(nε) for n additions.
+
+**Used in**: TimestepNorm group reduction, EMA parameter accumulation
+
+**Wrapper class**: `KahanWrapper<T>` provides `+=` operator with automatic compensation tracking.
+
+### Complex Number Utilities (`csrc/complex_utils.cuh`)
+
+**Purpose**: CUDA device functions for complex arithmetic.
+
+**Key functions**:
+- `Mul1i(z)`: Multiply by i: `-imag + i*real`
+- `RealOfProduct(z1, z2)`: Real part of `z1 * z2` without computing imaginary
+- `Exp(z)`: Complex exponential using `e^real * (cos(imag) + i*sin(imag))`
+
+**Uses**: `sincos` intrinsic for efficient simultaneous sin/cos computation.
+
+**Used in**: CEMA operations, EMA kernels
+
+### FFT Utilities (`csrc/fft.cuh`)
+
+**Purpose**: Custom FFT implementations for small sizes.
+
+**Features**:
+- `Log2(x)`: Compile-time log2 via switch statement
+- `LoadAsComplex`: Load real data as complex with zero imaginary part
+- Radix-2 FFT kernel: Cooley-Tukey algorithm for powers of 2
+- Twiddle factor computation on-the-fly or from LUT
+
+**Constants**:
+- `kFFTMaxLength = 16384`: Maximum sequence length for custom FFT
+- `kFFTNumThreads = 1024`: Threads per block for FFT
+
+**Twiddle factors** (`csrc/twiddle_factor.cuh`, `csrc/twiddle_factor_lut.cuh`):
+```cpp
+W_N^k = exp(-2πi * k / N)
+```
+Precomputed for common sizes, computed on-the-fly for others.
+
+**Used in**: FFTConv kernel for small sequences
+
+### CUDA Utilities (`csrc/cuda_utils.cuh`)
+
+**Purpose**: Common CUDA device functions and macros.
+
+**Likely contents** (not read in full):
+- Warp shuffle primitives
+- Reduction patterns (sum, max, etc.)
+- Block-level synchronization
+- Shared memory indexing helpers
+
+### Reduction Utilities (`csrc/reduce.cuh`)
+
+**Purpose**: Efficient parallel reduction primitives.
+
+**Patterns**:
+- Warp-level reduce (shuffle-based)
+- Block-level reduce (shared memory + tree reduction)
+- Grid-level reduce (atomic operations or multi-kernel)
+
+**Used in**: All kernels for computing sums, max, mean across dimensions
+
+### Register Utilities (`csrc/register_utils.cuh`)
+
+**Purpose**: Helpers for managing register-level data.
+
+**Likely functions**:
+- Array unrolling
+- Register spilling prevention
+- Template metaprogramming for compile-time loop unrolling
+
+### Softmax Utilities (`csrc/softmax.cuh`)
+
+**Purpose**: Numerically stable softmax implementations.
+
+**Algorithm**:
+```
+max = max(x)
+exp_sum = sum(exp(x - max))
+softmax(x) = exp(x - max) / exp_sum
+```
+
+**Variants**:
+- Row-wise softmax (for attention)
+- Masked softmax (for causal masking)
+- Online softmax (for flash attention)
+
+**Used in**: Attention kernels
+
+### Random Utilities (`csrc/random_utils.cuh`)
+
+**Purpose**: Fast random number generation on GPU.
+
+**Uses**: Likely cuRAND or custom PRNG for dropout masks.
+
+**Requirements**:
+- Reproducible: Same seed → same mask
+- Fast: Must not bottleneck training
+- Per-thread state: Each thread has independent PRNG
+
+**Used in**: Memory-efficient dropout (to regenerate masks in backward)
+
+### BLAS Wrappers (`csrc/blas.cc`, `csrc/blas.h`)
+
+**Purpose**: C++ wrappers for cuBLAS operations.
+
+**Likely operations**:
+- Matrix multiplication (GEMM)
+- Batched matrix multiplication
+- Strided batched operations
+
+**Used in**: Possibly for large matrix operations not handled by PyTorch
+
+---
+
+## Compilation and Build System
+
+### Extension Registration (`csrc/megalodon_extension.cc`)
+
+Registers all operations with PyBind11:
+
+```cpp
+PYBIND11_MODULE(megalodon_extension, m) {
+  py::module m_ops = m.def_submodule("ops", "Submodule for custom ops.");
+  ops::DefineAttentionOp(m_ops);
+  ops::DefineAttentionSoftmaxOp(m_ops);
+  ops::DefineEMAHiddenOp(m_ops);
+  ops::DefineEMAParametersOp(m_ops);
+  ops::DefineFFTConvOp(m_ops);
+  ops::DefineSequenceNormOp(m_ops);
+  ops::DefineTimestepNormOp(m_ops);
+}
+```
+
+Each `Define*Op` function binds the C++ functions to Python-callable names.
+
+### Build Configuration (`setup.py`)
+
+**Compilation flags**:
+
+C++:
+- `-O3`: Maximum optimization
+- `-std=c++17`: C++17 standard (for structured bindings, etc.)
+
+NVCC:
+- `--expt-relaxed-constexpr`: Allow constexpr in device code
+- `--expt-extended-lambda`: Allow extended lambda syntax
+- `--threads 4`: Parallel compilation
+
+**Include paths**: `megalodon/csrc` for headers
+
+**Source files**: All `.cc` and `.cu` files in `csrc/` and `csrc/ops/`
+
+### Dispatch Pattern
+
+Most kernels follow this pattern:
+
+1. **Python wrapper** (`megalodon/modules/fused_ops/*.py`):
+   - Defines `torch.autograd.Function` with `forward()` and `backward()`
+   - Calls into C++ extension
+
+2. **C++ dispatcher** (`csrc/ops/*.cc`):
+   - Validates inputs (dtypes, shapes, device)
+   - Dispatches to CPU or CUDA implementation
+   - Handles dtype conversion if needed
+
+3. **CUDA kernel** (`csrc/ops/*_kernel.cu`):
+   - Template kernels for different dtypes
+   - Launch configuration (grid, block dimensions)
+   - Actual computation
+
+Example from TimestepNorm:
+```
+Python: timestep_norm.py:TimestepNormFunc.forward()
+  ↓
+C++: ops/timestep_norm.cc:GroupTimestepNormFwd()
+  ↓ (if x.is_cuda())
+CUDA: ops/timestep_norm_kernel.cu:GroupTimestepNormCUDAFwdKernel<<<>>>()
+```
+
+---
+
+## Why Custom Kernels?
+
+Standard PyTorch operations don't cover Megalodon's needs:
+
+1. **TimestepNorm**: No PyTorch equivalent for running normalization across time
+2. **CEMA**: Complex-valued recurrence with specific structure
+3. **EMA Parameters**: Vandermonde matrix construction with complex coefficients
+4. **FFTConv**: Fused FFT + convolution with custom handling
+5. **Attention**: Memory-efficient flash attention variant
+
+**Performance gains**:
+- Kernel fusion: Multiple ops in one kernel launch (reduced memory traffic)
+- Custom memory layout: Optimized for access patterns
+- Reduced materialization: Don't store intermediate results
+- Better numerical stability: Specialized algorithms (Welford, Kahan, online softmax)
+
+**Estimated speedup** (vs. PyTorch native):
+- TimestepNorm: 3-5x (vs. manual loops in PyTorch)
+- FFTConv: 2x (vs. PyTorch FFT + multiply + iFFT)
+- Attention: 3-10x (vs. materialized attention matrix)
+- CEMA: 5-10x (vs. Python loops with complex numbers)
+
+These are rough estimates; actual speedup depends on sequence length, batch size, and hardware.
