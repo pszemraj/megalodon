@@ -25,6 +25,12 @@ This repository provides:
   - FFTConv: FFT-based convolution for sequence processing
   - Efficient attention: fused attention implementations (swift, fused variants)
 
+- **Triton kernel alternatives** (`megalodon/triton_kernels/`):
+  - Python-based GPU kernels as alternatives to CUDA C++ implementations
+  - Easier to modify and experiment with while maintaining competitive performance
+  - Includes: TimestepNorm, EMA Hidden, EMA Parameters, FFTConv, Flash Attention
+  - See `docs/triton_kernels.md` for detailed documentation and usage
+
 - **Distributed training support** (`megalodon/distributed/`):
   - FSDP (Fully Sharded Data Parallel) integration via fairscale
   - Model parallelism (tensor parallelism across GPUs)
@@ -76,3 +82,15 @@ Megalodon diverges from standard Transformers in several critical ways:
 5. **Three-way parallelism**: Unlike standard data/model parallelism, Megalodon adds chunk parallelism, allowing different GPUs to process different chunks of the same sequence in a pipeline-parallel fashion.
 
 This architecture is designed for scenarios where context length is critical (long document understanding, code with large repositories, etc.) and where standard transformers become prohibitively expensive.
+
+## Documentation Guide
+
+This documentation set includes:
+
+- **[README.md](README.md)** (this file): High-level overview of what Megalodon is and what's included
+- **[install.md](install.md)**: Installation instructions for CPU and GPU environments
+- **[usage.md](usage.md)**: Practical guide for running evaluation and text generation
+- **[architecture.md](architecture.md)**: System architecture, code organization, and data flow
+- **[internals.md](internals.md)**: Deep dive into MEGA attention, CEMA, and CUDA kernels with diagrams
+- **[triton_kernels.md](triton_kernels.md)**: Documentation for Python-based Triton kernel alternatives
+- **[status.md](status.md)**: Honest assessment of maturity, technical debt, and known issues
